@@ -1,0 +1,42 @@
+# OS junk
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual envs / conda env folders if any inside project
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Model checkpoints (big, can re-train)
+models/
+!models/pr2_baseline/epoch_3.pt   # keep your best baseline model if you want
+
+# Results (usually reproducible)
+results/
+!results/README.md  # you can create a tiny README to explain
+
+# Large intermediate data (optional – adjust if you want some committed)
+data/raw/
+data/blast_intermediate/
+*.tsv
+
+# But keep these key training files (override ignore with "!")
+!data/pr2_training_6000.csv
+!data/pr2_training_6000_with_seq.csv
+!data/pr2_18s_sample_6000.fasta
+
+# VS Code settings (optional to share)
+.vscode/
+
