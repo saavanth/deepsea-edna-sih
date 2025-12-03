@@ -24,7 +24,10 @@ RANKS = [
     "species",
 ]
 
-# Optional: put more weight on fine-grained ranks
+# Special label bucket for anything unknown / unseen / missing
+UNK_LABEL = "<UNK>"
+
+# Rank weights (we emphasize fine-grained ranks more)
 RANK_WEIGHTS = {
     "kingdom": 0.2,
     "supergroup": 0.4,
@@ -46,6 +49,8 @@ class PR2DnabertDataset(Dataset):
     Expects a DataFrame with columns:
       - "sequence"
       - one column per rank in RANKS
+
+    Unseen or missing labels are mapped to UNK_LABEL.
     """
 
     def __init__(self, df, tokenizer, max_length, ranks, rank_label_to_id):
@@ -67,12 +72,15 @@ class PR2DnabertDataset(Dataset):
         self.input_ids = torch.tensor(encodings["input_ids"], dtype=torch.long)
         self.attention_mask = torch.tensor(encodings["attention_mask"], dtype=torch.long)
 
-        # Encode labels
+        # Encode labels, mapping unseen / NaN to UNK
         label_rows = []
         for _, row in df.iterrows():
             label_vec = []
             for rank in self.ranks:
                 label_str = row[rank]
+                # NaN or unseen label → UNK
+                if pd.isna(label_str) or label_str not in self.rank_label_to_id[rank]:
+                    label_str = UNK_LABEL
                 label_vec.append(self.rank_label_to_id[rank][label_str])
             label_rows.append(label_vec)
 
@@ -97,6 +105,14 @@ def set_seed(seed: int = 42):
 
 
 def build_label_encoders(df, ranks):
+    """
+    Build label encoders from the TRAINING dataframe only.
+
+    For each rank:
+      - Collect all distinct labels from train
+      - Add an UNK_LABEL bucket
+      - Create label_to_id and id_to_label dicts
+    """
     rank_label_to_id = {}
     rank_id_to_label = {}
     rank_num_classes = {}
@@ -104,9 +120,17 @@ def build_label_encoders(df, ranks):
     for rank in ranks:
         if rank not in df.columns:
             raise ValueError(f"Required column '{rank}' not found in training CSV.")
+
+        # All distinct non-NaN labels in this rank
         labels = sorted(df[rank].dropna().unique().tolist())
+
+        # Always include an UNK label for unseen / missing values
+        if UNK_LABEL not in labels:
+            labels.append(UNK_LABEL)
+
         label_to_id = {label: idx for idx, label in enumerate(labels)}
         id_to_label = {idx: label for label, idx in label_to_id.items()}
+
         rank_label_to_id[rank] = label_to_id
         rank_id_to_label[rank] = id_to_label
         rank_num_classes[rank] = len(labels)
@@ -213,6 +237,7 @@ def save_checkpoint(
             "dropout": model.dropout,
             "freeze_encoder": model.freeze_encoder,
         },
+        "unk_label": UNK_LABEL,
     }
     torch.save(ckpt, path)
     print(f"✅ Saved checkpoint to {path}")
