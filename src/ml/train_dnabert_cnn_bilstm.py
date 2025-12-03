@@ -72,21 +72,29 @@ class PR2DnabertDataset(Dataset):
         self.input_ids = torch.tensor(encodings["input_ids"], dtype=torch.long)
         self.attention_mask = torch.tensor(encodings["attention_mask"], dtype=torch.long)
 
-        # Encode labels, mapping unseen / NaN to UNK
+        # Encode labels, mapping unseen / NaN to UNK, with hard fallback using dict.get
         label_rows = []
         for _, row in df.iterrows():
             label_vec = []
             for rank in self.ranks:
                 label_str = row[rank]
 
-                # NaN → UNK
+                # NaN -> UNK
                 if pd.isna(label_str):
                     label_str = UNK_LABEL
-                # Unknown label (e.g. appears only in val) → UNK
-                elif label_str not in self.rank_label_to_id[rank]:
+                else:
+                    # Ensure it's a string (some pandas dtypes can be weird)
+                    label_str = str(label_str)
+
+                label_to_id = self.rank_label_to_id[rank]
+                # If label is unknown, fall back to UNK_LABEL
+                if label_str not in label_to_id:
                     label_str = UNK_LABEL
 
-                label_vec.append(self.rank_label_to_id[rank][label_str])
+                # FINAL: always use .get with UNK fallback (this guarantees no KeyError)
+                label_id = label_to_id.get(label_str, label_to_id[UNK_LABEL])
+                label_vec.append(label_id)
+
             label_rows.append(label_vec)
 
         self.labels = torch.tensor(label_rows, dtype=torch.long)
@@ -127,7 +135,8 @@ def build_label_encoders(df, ranks):
             raise ValueError(f"Required column '{rank}' not found in training CSV.")
 
         # All distinct non-NaN labels in this rank
-        labels = sorted(df[rank].dropna().unique().tolist())
+        labels = df[rank].dropna().astype(str).unique().tolist()
+        labels = sorted(labels)
 
         # Always include an UNK label for unseen / missing values
         if UNK_LABEL not in labels:
