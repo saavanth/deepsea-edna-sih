@@ -1,417 +1,126 @@
-# src/ml/train_dnabert_cnn_bilstm.py
-
-import argparse
-import os
-import json
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import LabelEncoder
-from transformers import AutoTokenizer, AutoModel
+from torch import nn
+from transformers import AutoModel
 
 
-# ------------- CONFIG ------------- #
+class DnabertSCNNBiLSTM(nn.Module):
+    """
+    DNABERT-2 encoder + CNN + BiLSTM + multi-head taxonomy classifier.
 
-RANK_COLS: List[str] = [
-    "kingdom",
-    "supergroup",
-    "phylum",
-    "clade",
-    "class",
-    "order",
-    "family",
-    "genus",
-    "species",
-]
+    Expects:
+      - input_ids: (batch, seq_len)
+      - attention_mask: (batch, seq_len)
+    Returns:
+      - dict(rank -> logits tensor of shape (batch, num_classes_for_rank))
+    """
 
-# same idea as baseline: emphasize fine ranks more
-RANK_WEIGHTS: Dict[str, float] = {
-    "kingdom": 0.2,
-    "supergroup": 0.4,
-    "phylum": 0.6,
-    "clade": 0.8,
-    "class": 1.0,
-    "order": 1.5,
-    "family": 2.0,
-    "genus": 2.5,
-    "species": 3.0,
-}
-
-
-# ------------- DATASET & LABEL ENCODING ------------- #
-
-def build_label_encoders(df: pd.DataFrame) -> Dict[str, LabelEncoder]:
-    encoders: Dict[str, LabelEncoder] = {}
-    for col in RANK_COLS:
-        le = LabelEncoder()
-        vals = df[col].astype(str).fillna("unknown")
-        le.fit(vals.values)
-        encoders[col] = le
-    return encoders
-
-
-def encode_labels(df: pd.DataFrame, encoders: Dict[str, LabelEncoder]) -> np.ndarray:
-    all_labels = []
-    for col in RANK_COLS:
-        le = encoders[col]
-        vals = df[col].astype(str).fillna("unknown")
-        all_labels.append(le.transform(vals.values))
-    y = np.stack(all_labels, axis=1)  # (N, num_ranks)
-    return y
-
-
-class Pr2DnaBertDataset(Dataset):
     def __init__(
         self,
-        df: pd.DataFrame,
-        encoders: Dict[str, LabelEncoder],
-        tokenizer: AutoTokenizer,
-        max_len: int = 512,
-    ):
-        self.df = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-        self.seqs: List[str] = self.df["sequence"].astype(str).tolist()
-        self.y = encode_labels(self.df, encoders)  # (N, num_ranks)
-
-    def __len__(self) -> int:
-        return len(self.seqs)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        seq = self.seqs[idx]
-        labels = self.y[idx]  # (num_ranks,)
-
-        enc = self.tokenizer(
-            seq,
-            add_special_tokens=True,
-            truncation=True,
-            padding="max_length",
-            max_length=self.max_len,
-            return_tensors="pt",
-        )
-
-        item = {
-            "input_ids": enc["input_ids"].squeeze(0),      # (L,)
-            "attention_mask": enc["attention_mask"].squeeze(0),  # (L,)
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
-        return item
-
-
-# ------------- MODEL: DNABERT + CNN + BiLSTM ------------- #
-
-class DnaBertCnnBiLstm(nn.Module):
-    def __init__(
-        self,
-        bert_model_name: str,
-        rank_num_classes: Dict[str, int],
+        encoder_name: str,
+        ranks,
+        num_classes_per_rank,
         cnn_channels: int = 256,
-        cnn_kernel_size: int = 5,
-        lstm_hidden: int = 256,
+        lstm_hidden_size: int = 256,
         lstm_layers: int = 1,
         dropout: float = 0.3,
-        freeze_bert: bool = True,
+        freeze_encoder: bool = False,
     ):
         super().__init__()
 
-        self.rank_names = list(rank_num_classes.keys())
+        self.encoder_name = encoder_name
+        self.ranks = list(ranks)
+        self.num_classes_per_rank = dict(num_classes_per_rank)
+        self.cnn_channels = cnn_channels
+        self.lstm_hidden_size = lstm_hidden_size
+        self.lstm_layers = lstm_layers
+        self.dropout = dropout
+        self.freeze_encoder = freeze_encoder
 
-        # Pretrained DNABERT(-S) encoder
-        self.bert = AutoModel.from_pretrained(bert_model_name)
-        hidden_size = self.bert.config.hidden_size
+        # Load DNABERT-2 (or compatible) encoder
+        self.encoder = AutoModel.from_pretrained(
+            encoder_name,
+            trust_remote_code=True,
+            attn_implementation="eager",  # safer on Kaggle (avoids some flash-attn/triton issues)
+        )
+        hidden_size = self.encoder.config.hidden_size
 
-        # CNN over BERT hidden states
+        # CNN branch
         self.conv1 = nn.Conv1d(
             in_channels=hidden_size,
             out_channels=cnn_channels,
-            kernel_size=cnn_kernel_size,
-            padding=cnn_kernel_size // 2,
+            kernel_size=3,
+            padding=1,
         )
-        self.conv2 = nn.Conv1d(
-            in_channels=cnn_channels,
-            out_channels=cnn_channels,
-            kernel_size=cnn_kernel_size,
-            padding=cnn_kernel_size // 2,
-        )
+        self.conv_activation = nn.GELU()
+        self.conv_dropout = nn.Dropout(dropout)
 
-        # BiLSTM on top of CNN features
+        # BiLSTM branch
         self.lstm = nn.LSTM(
-            input_size=cnn_channels,
-            hidden_size=lstm_hidden,
+            input_size=hidden_size,
+            hidden_size=lstm_hidden_size,
             num_layers=lstm_layers,
             batch_first=True,
             bidirectional=True,
         )
+        self.lstm_dropout = nn.Dropout(dropout)
 
-        feat_dim = lstm_hidden * 2  # bidirectional
-        self.dropout = nn.Dropout(dropout)
+        feature_dim = cnn_channels + 2 * lstm_hidden_size
 
-        # One linear head per taxonomic rank
-        self.heads = nn.ModuleDict()
-        for rank, n_classes in rank_num_classes.items():
-            self.heads[rank] = nn.Linear(feat_dim, n_classes)
+        # One classification head per taxonomic rank
+        self.classifiers = nn.ModuleDict()
+        for rank in self.ranks:
+            n_classes = self.num_classes_per_rank[rank]
+            self.classifiers[rank] = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(feature_dim, n_classes),
+            )
 
-        if freeze_bert:
-            for p in self.bert.parameters():
+        if freeze_encoder:
+            for p in self.encoder.parameters():
                 p.requires_grad = False
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, input_ids, attention_mask=None):
         """
-        input_ids: (B, L)
-        attention_mask: (B, L)
-        returns: dict rank -> logits (B, num_classes)
+        Forward pass.
+
+        Returns:
+            logits_dict: {rank: (batch, num_classes)}
         """
-        # BERT encoder
-        outputs = self.bert(
+        encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        x = outputs.last_hidden_state  # (B, L, H)
+        hidden_states = encoder_outputs.last_hidden_state  # (B, L, H)
 
-        # CNN expects (B, H, L)
-        x = x.transpose(1, 2)  # (B, H, L)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = x.transpose(1, 2)  # (B, L, C)
+        if attention_mask is not None:
+            # Zero-out padded positions so CNN/LSTM don't see junk
+            mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)  # (B, L, 1)
+            hidden_states = hidden_states * mask
 
-        # BiLSTM
-        self.lstm.flatten_parameters()
-        lstm_out, _ = self.lstm(x)  # (B, L, 2 * lstm_hidden)
+        # CNN branch: (B, L, H) -> (B, H, L) -> (B, C, L) -> pooled (B, C)
+        x_cnn = hidden_states.permute(0, 2, 1)  # (B, H, L)
+        x_cnn = self.conv1(x_cnn)
+        x_cnn = self.conv_activation(x_cnn)
+        x_cnn = self.conv_dropout(x_cnn)
+        cnn_pooled = torch.max(x_cnn, dim=2).values  # (B, C)
 
-        # Masked global max pooling over L
-        mask = attention_mask.unsqueeze(-1).bool()  # (B, L, 1)
-        lstm_out_masked = lstm_out.masked_fill(~mask, -1e9)
-        pooled, _ = torch.max(lstm_out_masked, dim=1)  # (B, 2 * lstm_hidden)
+        # BiLSTM branch: (B, L, H) -> (B, L, 2*H_lstm) -> pooled (B, 2*H_lstm)
+        x_lstm, _ = self.lstm(hidden_states)  # (B, L, 2*H_lstm)
 
-        pooled = self.dropout(pooled)
+        if attention_mask is not None:
+            # Mask out padding before max-pooling
+            mask = attention_mask.unsqueeze(-1).to(x_lstm.dtype)  # (B, L, 1)
+            x_lstm = x_lstm * mask + (1.0 - mask) * (-1e9)
 
-        logits: Dict[str, torch.Tensor] = {}
-        for rank, head in self.heads.items():
-            logits[rank] = head(pooled)
+        lstm_pooled = torch.max(x_lstm, dim=1).values  # (B, 2*H_lstm)
+        lstm_pooled = self.lstm_dropout(lstm_pooled)
 
-        return logits
+        # Final shared feature vector
+        features = torch.cat([cnn_pooled, lstm_pooled], dim=1)  # (B, feature_dim)
 
-
-# ------------- TRAIN / EVAL LOOPS ------------- #
-
-def compute_loss(
-    logits: Dict[str, torch.Tensor],
-    labels: torch.Tensor,
-    criterion: nn.Module,
-    rank_names: List[str],
-) -> torch.Tensor:
-    """
-    labels: (B, num_ranks)
-    """
-    total_loss = 0.0
-    for i, rank in enumerate(rank_names):
-        weight = RANK_WEIGHTS[rank]
-        loss_rank = criterion(logits[rank], labels[:, i])
-        total_loss = total_loss + weight * loss_rank
-    return total_loss
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    rank_names: List[str],
-) -> float:
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    total_batches = 0
-
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)  # (B, num_ranks)
-
-        optimizer.zero_grad()
-        logits = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss = compute_loss(logits, labels, criterion, rank_names)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        total_batches += 1
-
-    return total_loss / max(total_batches, 1)
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    rank_names: List[str],
-) -> Tuple[float, Dict[str, float]]:
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    total_batches = 0
-
-    correct = {r: 0 for r in rank_names}
-    total = 0
-
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)  # (B, num_ranks)
-
-        logits = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss = compute_loss(logits, labels, criterion, rank_names)
-
-        total_loss += loss.item()
-        total_batches += 1
-
-        # accuracies
-        batch_size = labels.size(0)
-        total += batch_size
-        for i, rank in enumerate(rank_names):
-            preds = logits[rank].argmax(dim=1)  # (B,)
-            correct[rank] += (preds == labels[:, i]).sum().item()
-
-    avg_loss = total_loss / max(total_batches, 1)
-    acc = {r: correct[r] / max(total, 1) for r in rank_names}
-    return avg_loss, acc
-
-
-# ------------- MAIN ------------- #
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Train DNABERT-S + CNN + BiLSTM multi-rank taxonomy model on PR2."
-    )
-    parser.add_argument("--train-csv", default="data/pr2_train.csv")
-    parser.add_argument("--val-csv", default="data/pr2_val.csv")
-    parser.add_argument("--bert-model-name", required=True,
-                        help="Hugging Face model id for DNA-BERT(-S), e.g. 'your-dnabert-s-model-id'")
-    parser.add_argument("--max-len", type=int, default=512,
-                        help="Max token length for BERT input")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--out-dir", default="models/pr2_dnabert")
-    parser.add_argument("--freeze-bert", action="store_true",
-                        help="Freeze DNABERT encoder parameters")
-    args = parser.parse_args()
-
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # 1) Load data
-    train_df = pd.read_csv(args.train_csv)
-    val_df = pd.read_csv(args.val_csv)
-
-    # 2) Build encoders on TRAIN only
-    label_encoders = build_label_encoders(train_df)
-    rank_num_classes = {
-        rank: len(le.classes_) for rank, le in label_encoders.items()
-    }
-
-    print("Classes per rank:")
-    for r, n in rank_num_classes.items():
-        print(f"  {r:10s}: {n}")
-
-    # 3) Tokenizer & datasets
-    tokenizer = AutoTokenizer.from_pretrained(args.bert_model_name)
-
-    train_ds = Pr2DnaBertDataset(
-        train_df,
-        encoders=label_encoders,
-        tokenizer=tokenizer,
-        max_len=args.max_len,
-    )
-    val_ds = Pr2DnaBertDataset(
-        val_df,
-        encoders=label_encoders,
-        tokenizer=tokenizer,
-        max_len=args.max_len,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=2,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=2,
-    )
-
-    # 4) Model
-    model = DnaBertCnnBiLstm(
-        bert_model_name=args.bert_model_name,
-        rank_num_classes=rank_num_classes,
-        freeze_bert=args.freeze_bert,
-    )
-    model.to(device)
-
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-    )
-
-    rank_names = RANK_COLS
-
-    # 5) Training loop
-    best_species_acc = 0.0
-
-    for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
-
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, device, rank_names
-        )
-        val_loss, val_acc = evaluate(
-            model, val_loader, device, rank_names
-        )
-
-        print(f"  Train loss: {train_loss:.4f}")
-        print(f"  Val   loss: {val_loss:.4f}")
-        print("  Val acc per rank:")
-        for r in rank_names:
-            print(f"    {r:10s}: {val_acc[r]:.4f}")
-
-        # Track by species accuracy
-        species_acc = val_acc["species"]
-        if species_acc > best_species_acc:
-            best_species_acc = species_acc
-
-            # Build index->label mapping for convenient inference later
-            rank_index_to_label = {
-                rank: {int(i): str(lbl) for i, lbl in enumerate(le.classes_)}
-                for rank, le in label_encoders.items()
-            }
-
-            ckpt = {
-                "bert_model_name": args.bert_model_name,
-                "max_len": args.max_len,
-                "model_state_dict": model.state_dict(),
-                "rank_num_classes": rank_num_classes,
-                "label_encoders": label_encoders,
-                "rank_index_to_label": rank_index_to_label,
-            }
-            ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch}.pt")
-            torch.save(ckpt, ckpt_path)
-            print(f"  Saved checkpoint to: {ckpt_path}")
-
-
-if __name__ == "__main__":
-    main()
+        # Multi-head logits
+        logits_dict = {
+            rank: head(features)
+            for rank, head in self.classifiers.items()
+        }
+        return logits_dict
