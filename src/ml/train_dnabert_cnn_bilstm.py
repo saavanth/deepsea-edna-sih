@@ -78,9 +78,14 @@ class PR2DnabertDataset(Dataset):
             label_vec = []
             for rank in self.ranks:
                 label_str = row[rank]
-                # NaN or unseen label → UNK
-                if pd.isna(label_str) or label_str not in self.rank_label_to_id[rank]:
+
+                # NaN → UNK
+                if pd.isna(label_str):
                     label_str = UNK_LABEL
+                # Unknown label (e.g. appears only in val) → UNK
+                elif label_str not in self.rank_label_to_id[rank]:
+                    label_str = UNK_LABEL
+
                 label_vec.append(self.rank_label_to_id[rank][label_str])
             label_rows.append(label_vec)
 
